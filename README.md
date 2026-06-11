@@ -497,6 +497,11 @@ Install it with `sudo apt install -y espeak`. The `color_selector_node` catches 
 
 ---
 
+
+<img width="1600" height="999" alt="image" src="https://github.com/user-attachments/assets/c37aab69-6059-433d-b680-76082a960fb1" />
+
+
+
 ## Authors
 
 **Sanjeet Sathiyamoorthy**
