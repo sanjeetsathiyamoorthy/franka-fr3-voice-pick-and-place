@@ -1,0 +1,142 @@
+<?xml version="1.0"?>
+<!--
+  fr3_vision_env.urdf.xacro  —  Phase 4 FINAL
+  =============================================
+  Adds the overhead RGBD camera to the standard FR3 description.
+
+  IMPORTANT — world link:
+    When gazebo:=true (which we always pass from sim.launch.py), the included
+    franka_description xacro ALREADY generates:
+      <link name="world"/>
+      <joint name="world_joint" type="fixed"> world → base </joint>
+    Do NOT redeclare world here — that causes a fatal "link is not unique" error.
+    The camera joint is parented to fr3_link0, which is already in the tree.
+
+  Args passed from sim.launch.py:
+    hand:=true
+    ros2_control:=true
+    gazebo:=true        ← triggers world link + Gazebo plugin in franka_description
+    use_fake_hardware:=false
+    fake_sensor_commands:=false
+-->
+<robot xmlns:xacro="http://www.ros.org/wiki/xacro" name="fr3_vision">
+
+  <!-- ── Declare all args so xacro doesn't warn about undeclared overrides ── -->
+  <xacro:arg name="hand"                 default="true"/>
+  <xacro:arg name="ros2_control"         default="true"/>
+  <xacro:arg name="gazebo"               default="true"/>
+  <xacro:arg name="use_fake_hardware"    default="false"/>
+  <xacro:arg name="fake_sensor_commands" default="false"/>
+  <xacro:arg name="robot_ip"             default="dont-care"/>
+  <xacro:arg name="robot_type"           default="fr3"/>
+
+  <!-- ── Official FR3 arm description ──────────────────────────────────────
+       All args are forwarded through to fr3.urdf.xacro via the command-line
+       xacro argument mechanism (xacro shares args across includes).
+       With gazebo:=true this also generates:
+         - <ros2_control> hardware block  (gz_ros2_control/GazeboSimSystem)
+         - <gazebo><plugin>               (ign_ros2_control/IgnitionROS2ControlPlugin)
+         - <link name="world"/>  +  world_joint
+  -->
+  <xacro:include filename="$(find franka_description)/robots/fr3/fr3.urdf.xacro"/>
+
+  <!-- ── Overhead camera link ───────────────────────────────────────────────
+       MUST have <inertial> — Ignition Gazebo collapses massless links into
+       their parent during URDF→SDF conversion, silently deleting the sensor.
+  -->
+  <link name="camera_link">
+    <inertial>
+      <mass value="0.1"/>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <inertia ixx="1e-4" ixy="0" ixz="0"
+                          iyy="1e-4" iyz="0"
+                                     izz="1e-4"/>
+    </inertial>
+    <visual>
+      <geometry><box size="0.025 0.090 0.025"/></geometry>
+      <material name="black"><color rgba="0.1 0.1 0.1 1"/></material>
+    </visual>
+    <collision>
+      <geometry><box size="0.025 0.090 0.025"/></geometry>
+    </collision>
+  </link>
+
+  <!--
+    Mount the camera 0.5 m forward and 1.0 m above fr3_link0,
+    pitched 90° so it looks straight down.
+  -->
+  <joint name="camera_joint" type="fixed">
+    <parent link="fr3_link0"/>
+    <child  link="camera_link"/>
+    <origin xyz="0.5 0.0 1.0" rpy="0 ${pi/2} 0"/>
+  </joint>
+
+  <!-- ── Ignition Gazebo RGBD sensor ───────────────────────────────────────
+       Publishes on /camera/{image,depth_image,points,camera_info}.
+       Bridged to ROS 2 topics by ros_gz_bridge in sim.launch.py.
+  -->
+  <gazebo reference="camera_link">
+    <sensor type="rgbd_camera" name="realsense_d435">
+      <ignition_frame_id>camera_link</ignition_frame_id>
+      <always_on>1</always_on>
+      <update_rate>30</update_rate>
+      <visualize>1</visualize>
+      <topic>/camera</topic>
+      <camera name="overhead_rgbd">
+        <horizontal_fov>1.2</horizontal_fov>
+        <image>
+          <width>640</width>
+          <height>480</height>
+          <format>R8G8B8</format>
+        </image>
+        <clip>
+          <near>0.1</near>
+          <far>5.0</far>
+        </clip>
+      </camera>
+      <plugin filename="libignition-gazebo-sensors-system.so"
+              name="ignition::gazebo::systems::Sensors">
+        <render_engine>ogre2</render_engine>
+      </plugin>
+    </sensor>
+  </gazebo>
+
+
+  <!-- ── Gripper finger control (bypasses gz_ros2_control mimic bug #343) ──────
+       fr3_finger_joint1 is the mimic LEADER; fr3_finger_joint2 mimics it in the
+       URDF, which makes gz_ros2_control refuse to actuate joint1 via its position
+       command interface (https://github.com/ros-controls/gz_ros2_control/issues/343).
+       Ignition also does not enforce URDF <mimic> on its own, so joint2 follows
+       nothing. We therefore drive BOTH fingers directly with Ignition's native
+       JointPositionController and command them to the same value from pick.py.
+       NOTE: the fr3_gripper ros2_control controller must NOT be spawned, or it
+       will fight these plugins for fr3_finger_joint1. (Removed in sim_launch.py.)
+  -->
+  <gazebo>
+    <plugin filename="ignition-gazebo-joint-position-controller-system"
+            name="ignition::gazebo::systems::JointPositionController">
+      <joint_name>fr3_finger_joint1</joint_name>
+      <topic>/fr3_finger_joint1_cmd</topic>
+      <p_gain>2000</p_gain>
+      <i_gain>15</i_gain>
+      <d_gain>40</d_gain>
+      <i_max>100</i_max>
+      <i_min>-100</i_min>
+      <cmd_max>100</cmd_max>
+      <cmd_min>-100</cmd_min>
+    </plugin>
+    <plugin filename="ignition-gazebo-joint-position-controller-system"
+            name="ignition::gazebo::systems::JointPositionController">
+      <joint_name>fr3_finger_joint2</joint_name>
+      <topic>/fr3_finger_joint2_cmd</topic>
+      <p_gain>2000</p_gain>
+      <i_gain>15</i_gain>
+      <d_gain>40</d_gain>
+      <i_max>100</i_max>
+      <i_min>-100</i_min>
+      <cmd_max>100</cmd_max>
+      <cmd_min>-100</cmd_min>
+    </plugin>
+  </gazebo>
+
+</robot>
