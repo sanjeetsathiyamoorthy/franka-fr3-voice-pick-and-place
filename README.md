@@ -93,6 +93,7 @@ Ensure the following are installed and configured before building.
 | franka_ros2 | Humble branch |
 | Python | 3.10 or later |
 | espeak | Any version available via apt |
+| logitech webcam | C270 |
 
 **Hardware required:**
 - Franka Research 3 arm
