@@ -7,6 +7,7 @@ Publishes workspace limits and all detected block coordinates unconditionally.
 """
 
 import math
+from collections import deque
 
 import cv2
 import cv2.aruco as aruco
@@ -103,6 +104,14 @@ class ArucoVisionDetector(Node):
         self.H     = None
         self.H_age = 0
 
+        # Per-colour circular buffers for angle smoothing (10 frames each).
+        # Using a deque so old readings drop off automatically.
+        self._angle_history = {
+            'RED':   deque(maxlen=10),
+            'GREEN': deque(maxlen=10),
+            'BLUE':  deque(maxlen=10),
+        }
+
         self._build_trackbars()
         self.timer = self.create_timer(1.0 / 30.0, self._process_frame)
 
@@ -189,8 +198,10 @@ class ArucoVisionDetector(Node):
         return True
 
     def _detect_color(self, frame, hsv, h_min, h_max, s_min, s_max, v_min, v_max,
-                      is_red: bool = False):
+                      is_red: bool = False, color_key: str = ''):
+        # ── Mask ──────────────────────────────────────────────────────────────
         if is_red:
+            # Red wraps around 0/180 in HSV — combine both halves
             mask = cv2.bitwise_or(
                 cv2.inRange(hsv,
                             np.array([0,     s_min, v_min]),
@@ -207,6 +218,7 @@ class ArucoVisionDetector(Node):
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,   np.ones((5, 5), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_DILATE, np.ones((3, 3), np.uint8))
 
+        # ── Contour ───────────────────────────────────────────────────────────
         contours, _ = cv2.findContours(
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
@@ -223,18 +235,98 @@ class ArucoVisionDetector(Node):
         cx = int(M['m10'] / M['m00'])
         cy = int(M['m01'] / M['m00'])
 
-        rect      = cv2.minAreaRect(largest)        
-        angle_deg = rect[2]                         
-        if angle_deg < -45.0:
-            angle_deg += 90.0
-        angle_rad = math.radians(angle_deg)
+        # ── Angle — computed in robot frame ───────────────────────────────────
+        # FIX 1: take the convex hull before fitting the rectangle.
+        # Raw contours have jagged edges from HSV noise that skew the box fit.
+        hull = cv2.convexHull(largest)
+        rect = cv2.minAreaRect(hull)
+        (cx_r, cy_r), (w, h), _ = rect
+        box  = cv2.boxPoints(rect).astype(np.float32)
 
-        box = cv2.boxPoints(rect).astype(np.int32)
-        cv2.drawContours(frame, [box], -1, (0, 200, 255), 2)
-        length = 30
-        ex = int(cx + length * math.cos(angle_rad))
-        ey = int(cy + length * math.sin(angle_rad))
+        # FIX 2: identify the LONG axis endpoints explicitly.
+        # The old code relied on rect[2] which is ambiguous when width ≈ height
+        # and whose sign convention changes depending on OpenCV version.
+        e0_len = float(np.linalg.norm(box[1] - box[0]))
+        e1_len = float(np.linalg.norm(box[2] - box[1]))
+        if e0_len >= e1_len:
+            p1_px, p2_px = box[0], box[1]
+        else:
+            p1_px, p2_px = box[1], box[2]
+
+        # FIX 3: compute the angle IN ROBOT FRAME, not pixel frame.
+        # Camera may be rotated/skewed relative to the robot X-axis — computing
+        # atan2 in pixel space gives the wrong yaw to send to the gripper.
+        # Transforming both long-axis endpoints through the homography and then
+        # computing atan2 in robot coordinates corrects for any camera tilt.
+        if self.H is not None and self.H_age <= H_MAX_AGE:
+            wx1, wy1 = self._pixel_to_robot(float(p1_px[0]), float(p1_px[1]))
+            wx2, wy2 = self._pixel_to_robot(float(p2_px[0]), float(p2_px[1]))
+            raw_angle = math.atan2(wy2 - wy1, wx2 - wx1)
+        else:
+            # Homography not ready — fall back to pixel-space angle
+            raw_angle = math.atan2(
+                float(p2_px[1] - p1_px[1]),
+                float(p2_px[0] - p1_px[0])
+            )
+
+        # FIX 4: normalise to [-π/4, +π/4]  (90° periodicity).
+        # The blocks are cubes — square cross-section — so the gripper can
+        # pick them equivalently at 0°, 90°, 180°, or 270°.  Folding into a
+        # quarter-circle makes the result invariant to which edge of the
+        # bounding box happens to be identified as "long".  Without this,
+        # near-square hulls (where both edges are almost the same length) can
+        # flip the axis selection frame-to-frame, producing a 90° jump in the
+        # published yaw even though the block hasn't moved — the exact symptom
+        # seen with the blue block whose arrow flipped 90° vs red and green.
+        raw_angle = (raw_angle + math.pi / 4.0) % (math.pi / 2.0) - math.pi / 4.0
+
+        # FIX 5: temporal smoothing with outlier rejection.
+        # Single-frame angle estimates are noisy (lighting flicker, partial
+        # occlusion, HSV boundary pixels).  We keep a 10-frame circular buffer
+        # per colour and compute the circular mean.  Any frame whose angle
+        # differs from the running mean by more than 25° is treated as a
+        # spurious spike and discarded so it cannot corrupt the smooth value.
+        angle_rad = raw_angle
+        if color_key and color_key in self._angle_history:
+            hist = self._angle_history[color_key]
+            if hist:
+                sin_m  = sum(math.sin(a) for a in hist) / len(hist)
+                cos_m  = sum(math.cos(a) for a in hist) / len(hist)
+                smooth = math.atan2(sin_m, cos_m)
+                diff   = abs(math.atan2(
+                    math.sin(raw_angle - smooth),
+                    math.cos(raw_angle - smooth)
+                ))
+                if diff > math.radians(25):
+                    # Outlier — keep the current smooth value, don't add to history
+                    angle_rad = smooth
+                else:
+                    hist.append(raw_angle)
+                    sin_m = sum(math.sin(a) for a in hist) / len(hist)
+                    cos_m = sum(math.cos(a) for a in hist) / len(hist)
+                    angle_rad = math.atan2(sin_m, cos_m)
+            else:
+                # First detection for this colour — seed the buffer
+                hist.append(raw_angle)
+                angle_rad = raw_angle
+
+        # ── Visualisation ─────────────────────────────────────────────────────
+        box_int = box.astype(np.int32)
+        cv2.drawContours(frame, [box_int], -1, (0, 200, 255), 2)
+
+        # Draw the long-axis arrow using pixel-space direction (cosmetic only)
+        dx = float(p2_px[0] - p1_px[0])
+        dy = float(p2_px[1] - p1_px[1])
+        norm = math.hypot(dx, dy) or 1.0
+        length = 35
+        ex = int(cx + length * dx / norm)
+        ey = int(cy + length * dy / norm)
         cv2.arrowedLine(frame, (cx, cy), (ex, ey), (255, 255, 0), 2, tipLength=0.3)
+
+        # Show the robot-frame angle so you can verify it live
+        cv2.putText(frame, f'{math.degrees(angle_rad):.1f}',
+                    (cx + 12, cy - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
 
         return cx, cy, angle_rad, mask
 
@@ -299,7 +391,8 @@ class ArucoVisionDetector(Node):
         # ── Red ───────────────────────────────────────────────────────────────
         rh_min, rh_max, rs_min, rs_max, rv_min, rv_max = self._read_trackbars('HSV Tuning')
         rcx, rcy, r_angle, red_mask = self._detect_color(
-            frame, hsv, rh_min, rh_max, rs_min, rs_max, rv_min, rv_max, is_red=True)
+            frame, hsv, rh_min, rh_max, rs_min, rs_max, rv_min, rv_max,
+            is_red=True, color_key='RED')
         if rcx is not None:
             cv2.circle(frame, (rcx, rcy), 8, (0, 0, 255), -1)
             self._try_publish(frame, rcx, rcy, r_angle, 'RED',
@@ -308,7 +401,8 @@ class ArucoVisionDetector(Node):
         # ── Green ─────────────────────────────────────────────────────────────
         gh_min, gh_max, gs_min, gs_max, gv_min, gv_max = self._read_trackbars('Green HSV')
         gcx, gcy, g_angle, green_mask = self._detect_color(
-            frame, hsv, gh_min, gh_max, gs_min, gs_max, gv_min, gv_max)
+            frame, hsv, gh_min, gh_max, gs_min, gs_max, gv_min, gv_max,
+            color_key='GREEN')
         if gcx is not None:
             cv2.circle(frame, (gcx, gcy), 8, (0, 255, 0), -1)
             self._try_publish(frame, gcx, gcy, g_angle, 'GREEN',
@@ -317,7 +411,8 @@ class ArucoVisionDetector(Node):
         # ── Blue ──────────────────────────────────────────────────────────────
         bh_min, bh_max, bs_min, bs_max, bv_min, bv_max = self._read_trackbars('Blue HSV')
         bcx, bcy, b_angle, blue_mask = self._detect_color(
-            frame, hsv, bh_min, bh_max, bs_min, bs_max, bv_min, bv_max)
+            frame, hsv, bh_min, bh_max, bs_min, bs_max, bv_min, bv_max,
+            color_key='BLUE')
         if bcx is not None:
             cv2.circle(frame, (bcx, bcy), 8, (255, 0, 0), -1)
             self._try_publish(frame, bcx, bcy, b_angle, 'BLUE',

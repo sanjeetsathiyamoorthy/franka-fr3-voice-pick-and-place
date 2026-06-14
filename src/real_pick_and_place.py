@@ -4,7 +4,7 @@ real_pick_and_place.py  —  fr3_delivery_sim  (REAL Franka Research 3 hardware)
 =============================================================================
 Updated for voice-controlled pick-and-place pipeline.
 
-Three execution modes (all triggered by color_selector_node):
+Five execution modes (all triggered by color_selector_node):
   1. Full pick+place : /voice_pick_target + /place_target  → run()
   2. Pick only       : /pick_only_target                   → run_pick_only()
   3. Place only      : /place_only_target                  → run_place_only()
@@ -26,13 +26,12 @@ from moveit_msgs.msg import (
     PositionConstraint, OrientationConstraint, BoundingVolume,
     CollisionObject, PlanningScene,
 )
-from shape_msgs.msg import SolidPrimitive, Plane
+from shape_msgs.msg import SolidPrimitive
 from control_msgs.action import FollowJointTrajectory
 
 from geometry_msgs.msg import Point, Pose, Quaternion, Vector3
 from sensor_msgs.msg import JointState
 from std_msgs.msg import Bool, Float64, String
-from std_msgs.msg import Header
 from builtin_interfaces.msg import Duration
 
 try:
@@ -53,10 +52,6 @@ ARM_JOINTS = [
 HOME = [0.0, -0.785398, 0.0, -2.356194, 0.0, 1.570796, 0.785398]
 
 MOVEIT_SUCCESS = 1
-
-# Camera workspace bounds — blocks picked from vision must be within these
-BLOCK_X_MIN, BLOCK_X_MAX =  0.25,  0.55
-BLOCK_Y_MIN, BLOCK_Y_MAX = -0.35,  0.20
 
 # ── Behind-robot zone handling ─────────────────────────────────────────────────
 BEHIND_ROBOT_X  = 0.0    
@@ -344,6 +339,8 @@ class RealPickAndPlace(Node):
         return self._send_action(self._grasp_client, goal, 'grasp')
 
     def localize_block(self, pose_xy=None, skip_bounds=False, custom_gz=None):
+        # Note: skip_bounds is accepted for call-site compatibility but not used
+        # here — workspace bounds checking happens upstream in color_selector_node.
         xy = pose_xy if pose_xy is not None else self._latest_block_pose
         if xy is None: return None
         x, y = xy
@@ -443,6 +440,9 @@ class RealPickAndPlace(Node):
     def move_to_joints(self, joints, label='home'):
         self.get_logger().info(f'--> {label} (joint space)')
         traj = self._plan_goal(self._joint_constraints(joints))
+        if traj is None:
+            self.get_logger().error(f'{label}: joint-space planning failed — skipping move.')
+            return False
         return self._execute(traj)
 
     def go_home(self):
@@ -482,7 +482,12 @@ class RealPickAndPlace(Node):
         fut = self._cart_client.call_async(req)
         rclpy.spin_until_future_complete(self, fut, timeout_sec=10.0)
         resp = fut.result()
-        if resp is None or resp.fraction < self.min_fraction: return None
+        if resp is None or resp.fraction < self.min_fraction:
+            if resp is not None:
+                self.get_logger().warn(
+                    f'Cartesian path incomplete (fraction={resp.fraction:.2f} '
+                    f'< {self.min_fraction:.2f}) — falling back to joint space.')
+            return None
         traj = resp.solution.joint_trajectory
         if not traj.points: return None
         return self._retime(traj, abs(travel_dist))
@@ -547,8 +552,17 @@ class RealPickAndPlace(Node):
             lift = (bx, by, transit_z)
             drop_above = (drop[0], drop[1], transit_z)
 
+            # Flush any pending /grasp_yaw callback that arrived just before the
+            # pick target.  Without this, tight timing can leave _grasp_yaw_override
+            # unset if the callback hadn't been dispatched yet by the main-loop drain.
+            rclpy.spin_once(self, timeout_sec=0.05)
+
             pick_yaw = self._grasp_yaw_override
             self._grasp_yaw_override = None
+            if pick_yaw is not None:
+                self.get_logger().info(f'[run] Grasp yaw: {math.degrees(pick_yaw):.1f}°')
+            else:
+                self.get_logger().info('[run] No grasp yaw received — using default 0.0°')
 
             pick_steps = [
                 ('1. Hover above block',  lambda: self.move_to_pose(hover, 'hover', yaw=pick_yaw)),
@@ -613,8 +627,16 @@ class RealPickAndPlace(Node):
             hover     = (bx, by, self.table_z + self.cube_half + self.approach_height)
             grasp     = (bx, by, self.grasp_z)
             lift      = (bx, by, travel_z)
+
+            # Flush pending /grasp_yaw callback (see run() for explanation).
+            rclpy.spin_once(self, timeout_sec=0.05)
+
             pick_yaw = self._grasp_yaw_override
             self._grasp_yaw_override = None
+            if pick_yaw is not None:
+                self.get_logger().info(f'[run_pick_only] Grasp yaw: {math.degrees(pick_yaw):.1f}°')
+            else:
+                self.get_logger().info('[run_pick_only] No grasp yaw received — using default 0.0°')
 
             steps = [
                 ('1. Hover above block', lambda: self.move_to_pose(hover, 'hover', yaw=pick_yaw)),
